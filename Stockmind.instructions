@@ -1,0 +1,687 @@
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install streamlit pandas plotly yfinance python-dotenv openai
+streamlit run app.py
+stockmind/
+├── app.py
+├── requirements.txt
+└── stockmind/
+    ├── __init__.py
+    ├── ai.py
+    ├── data.py
+    ├── db.py
+    └── education.py
+    streamlit>=1.40,<2
+pandas>=2.2,<3
+plotly>=5.24,<7
+yfinance>=0.2.50,<2
+python-dotenv>=1.0,<2
+openai>=1.50,<3
+"""StockMind application services."""
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent.parent / "stockmind.db"
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS watchlist "
+        "(symbol TEXT PRIMARY KEY, added_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    return conn
+
+
+def get_watchlist():
+    with _connect() as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT symbol FROM watchlist ORDER BY added_at DESC"
+            )
+        ]
+
+
+def add_ticker(symbol):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO watchlist(symbol) VALUES (?)",
+            (symbol.upper(),),
+        )
+
+
+def remove_ticker(symbol):
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM watchlist WHERE symbol = ?",
+            (symbol.upper(),),
+        )
+        EXPLANATIONS = {
+    "Revenue": (
+        "Revenue is the gross income from ordinary business activities before expenses, taxes, or financing costs.",
+        "Revenue is the money a company brings in from selling its products or services, before paying its bills.",
+    ),
+    "Net income": (
+        "Net income is profit after operating costs, interest, taxes, and other expenses for the reporting period.",
+        "Net income is what remains after the company has paid its expenses and taxes.",
+    ),
+    "Profit margin": (
+        "Net profit margin is net income divided by revenue; it measures the share of sales retained as profit.",
+        "It shows how much profit the company keeps from each euro or dollar of sales.",
+    ),
+    "Debt": (
+        "Debt represents contractual borrowing obligations. Assess maturity, interest costs, cash flows, and liquidity alongside the balance.",
+        "Debt is money the company owes. Whether it is manageable depends on its cash and ability to make payments.",
+    ),
+    "P/E ratio": (
+        "Price-to-earnings is share price divided by earnings per share, usually trailing or forward. It is not meaningful for negative earnings.",
+        "P/E compares the share price with the company's earnings per share. A higher number does not by itself mean a share is expensive.",
+    ),
+}
+
+GERMAN = {
+    "Revenue": (
+        "Der Umsatz umfasst die Erlöse aus der gewöhnlichen Geschäftstätigkeit vor Kosten, Steuern und Finanzierung.",
+        "Der Umsatz ist das Geld, das ein Unternehmen durch Verkäufe einnimmt, bevor es Rechnungen bezahlt.",
+    ),
+    "Net income": (
+        "Der Jahresüberschuss ist der Gewinn nach Betriebsaufwand, Zinsen, Steuern und sonstigen Aufwendungen.",
+        "Der Jahresüberschuss ist das, was nach Kosten und Steuern übrig bleibt.",
+    ),
+    "Profit margin": (
+        "Die Nettomarge ist der Jahresüberschuss geteilt durch den Umsatz und misst den Gewinnanteil am Umsatz.",
+        "Sie zeigt, wie viel Gewinn das Unternehmen von einem Euro Umsatz behält.",
+    ),
+    "Debt": (
+        "Die Verschuldung umfasst vertragliche Kreditverpflichtungen. Laufzeiten, Zinskosten, Cashflows und Liquidität gehören zur Beurteilung.",
+        "Schulden sind Geld, das das Unternehmen zurückzahlen muss. Entscheidend ist auch, ob genug Geld dafür vorhanden ist.",
+    ),
+    "P/E ratio": (
+        "Das Kurs-Gewinn-Verhältnis setzt Aktienkurs ins Verhältnis zum Gewinn je Aktie. Bei negativem Gewinn ist es nicht aussagekräftig.",
+        "Das KGV vergleicht den Aktienkurs mit dem Gewinn je Aktie. Ein hoher Wert bedeutet allein nicht, dass eine Aktie teuer ist.",
+    ),
+}
+
+
+def metric_explanation(name, language="English"):
+    explanations = GERMAN if language == "Deutsch" else EXPLANATIONS
+    return explanations[name]
+from datetime import datetime, timezone
+
+import pandas as pd
+import yfinance as yf
+
+
+def _fmt_money(value):
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if value != value:  # NaN
+        return None
+
+    magnitude = abs(value)
+    if magnitude >= 1e12:
+        return f"{value / 1e12:,.2f}T"
+    if magnitude >= 1e9:
+        return f"{value / 1e9:,.2f}B"
+    if magnitude >= 1e6:
+        return f"{value / 1e6:,.2f}M"
+    return f"{value:,.2f}"
+
+
+def get_market_overview():
+    symbols = [
+        ("S&P 500", "^GSPC"),
+        ("NASDAQ", "^IXIC"),
+        ("DAX", "^GDAXI"),
+    ]
+    output = []
+
+    for name, symbol in symbols:
+        try:
+            history = yf.Ticker(symbol).history(period="2d")
+            if len(history) >= 1:
+                price = float(history["Close"].iloc[-1])
+                previous = (
+                    float(history["Close"].iloc[-2])
+                    if len(history) > 1
+                    else None
+                )
+                change = (
+                    f"{(price / previous - 1) * 100:+.2f}%"
+                    if previous
+                    else None
+                )
+                output.append({
+                    "name": name,
+                    "price": f"{price:,.2f}",
+                    "change": change,
+                })
+                continue
+        except Exception:
+            pass
+
+        output.append({"name": name, "price": "—", "change": None})
+
+    return output
+
+
+def search_companies(query):
+    try:
+        results = yf.Search(query, max_results=8).quotes
+        return [
+            {
+                "symbol": item.get("symbol", ""),
+                "name": (
+                    item.get("shortname")
+                    or item.get("longname")
+                    or item.get("symbol", "")
+                ),
+                "exchange": item.get("exchange", "—"),
+            }
+            for item in results
+            if item.get("symbol") and item.get("quoteType") == "EQUITY"
+        ]
+    except Exception:
+        return []
+
+
+def get_company(symbol):
+    retrieved = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.get_info()
+
+        if not info or not info.get("symbol"):
+            return {"error": "No company record returned by the data provider."}
+
+        financials = ticker.financials
+
+        def latest_row(*names):
+            for name in names:
+                if name in financials.index:
+                    values = financials.loc[name].dropna()
+                    if not values.empty:
+                        return values.iloc[0]
+            return None
+
+        revenue = latest_row("Total Revenue", "Operating Revenue")
+        income = latest_row("Net Income")
+        debt = latest_row("Total Debt")
+        margin = income / revenue if income is not None and revenue else None
+
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        change = info.get("regularMarketChangePercent")
+        currency = info.get("currency")
+
+        strengths = []
+        risks = []
+
+        if margin is not None:
+            message = f"Latest reported net margin is {margin:.1%}."
+            (strengths if margin > 0 else risks).append(message)
+
+        if info.get("returnOnEquity") is not None:
+            strengths.append(
+                f"Reported return on equity is {info['returnOnEquity']:.1%}."
+            )
+
+        if (
+            debt is not None
+            and info.get("totalCash") is not None
+            and debt > info["totalCash"]
+        ):
+            risks.append(
+                "Reported total debt exceeds reported cash; "
+                "review maturity and cash flow details."
+            )
+
+        def money_with_currency(value):
+            formatted = _fmt_money(value)
+            if formatted is None:
+                return None
+            return f"{formatted} {currency}" if currency else formatted
+
+        return {
+            "name": info.get("longName") or info.get("shortName"),
+            "summary": info.get("longBusinessSummary"),
+            "price": (
+                f"{price:,.2f} {currency}"
+                if price is not None and currency
+                else _fmt_money(price)
+            ),
+            "change": f"{change:+.2f}%" if change is not None else None,
+            "revenue": money_with_currency(revenue),
+            "net_income": money_with_currency(income),
+            "margin": f"{margin:.1%}" if margin is not None else None,
+            "debt": money_with_currency(debt),
+            "pe": (
+                f"{info['trailingPE']:.2f}"
+                if info.get("trailingPE") is not None
+                else None
+            ),
+            "strengths": strengths,
+            "risks": risks,
+            "retrieved_at": retrieved,
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {
+            "error": f"Data provider error ({type(exc).__name__}). Please retry later."
+        }
+
+
+def get_history(symbol):
+    try:
+        history = yf.Ticker(symbol).history(
+            period="5y",
+            auto_adjust=True,
+        )
+        return history if history is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+        import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def ask_analyst(question, ticker, company, level="Beginner", language="English"):
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        if language == "Deutsch":
+            return (
+                f"**Lokaler Erklärmodus für {ticker}**\n\n"
+                "Es ist kein KI-API-Schlüssel eingerichtet. "
+                "Die verfügbaren Daten können Kennzahlen und den Unternehmensüberblick "
+                "enthalten, aber ich kann ohne KI-Dienst keine freie Frage beantworten. "
+                "Nutze den Lernmodus für verlässliche Grundbegriffe.\n\n"
+                f"Deine Frage: {question}"
+            )
+
+        return (
+            f"**Local explanation mode for {ticker}**\n\n"
+            "No AI API key is configured. Available source data may include metrics "
+            "and a company description, but I cannot answer free-form questions "
+            "without an AI service. Use Educational mode for built-in metric "
+            "explanations.\n\n"
+            f"Your question: {question}"
+        )
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+        )
+
+        language_rule = (
+            "Answer in German."
+            if language == "Deutsch"
+            else "Answer in English."
+        )
+
+        prompt = (
+            f"{language_rule} You are a financial research educator. "
+            "Do not give investment advice, price targets, or predictions. "
+            f"Explain at {level.lower()} level. Use only the provided company "
+            "context; explicitly say when data is missing. "
+            f"Ticker {ticker}. Context: {company}. Question: {question}"
+        )
+
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content
+
+    except Exception as exc:
+        return (
+            f"AI service unavailable ({type(exc).__name__}). "
+            "Try again later or use Educational mode."
+        )
+        from datetime import datetime, timezone
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from stockmind.ai import ask_analyst
+from stockmind.data import (
+    get_company,
+    get_history,
+    get_market_overview,
+    search_companies,
+)
+from stockmind.db import add_ticker, get_watchlist, remove_ticker
+from stockmind.education import metric_explanation
+
+st.set_page_config(
+    page_title="StockMind | Financial Research",
+    page_icon="◈",
+    layout="wide",
+)
+
+TEXT = {
+    "English": {
+        "overview": "Market overview",
+        "dashboard": "Dashboard",
+        "analysis": "Company analysis",
+        "analyst": "AI Analyst",
+        "education": "Educational mode",
+        "watchlist": "Watchlist",
+        "search": "Search companies",
+        "ticker": "Ticker symbol",
+        "refresh": "Analyze",
+        "missing": "Not reported",
+        "source": "Source: Yahoo Finance via yfinance · Retrieved",
+        "no_data": "Data is unavailable for this symbol right now.",
+    },
+    "Deutsch": {
+        "overview": "Marktüberblick",
+        "dashboard": "Dashboard",
+        "analysis": "Unternehmensanalyse",
+        "analyst": "KI-Analyst",
+        "education": "Lernmodus",
+        "watchlist": "Beobachtungsliste",
+        "search": "Unternehmen suchen",
+        "ticker": "Börsenkürzel",
+        "refresh": "Analysieren",
+        "missing": "Keine Angabe",
+        "source": "Quelle: Yahoo Finance via yfinance · Abgerufen",
+        "no_data": "Für dieses Symbol sind derzeit keine Daten verfügbar.",
+    },
+}
+
+st.markdown(
+    """
+    <style>
+      .stApp {
+        background: #0b1018;
+        color: #e7edf5;
+      }
+      [data-testid="stSidebar"] {
+        background: #101722;
+        border-right: 1px solid #253141;
+      }
+      h1, h2, h3 {
+        letter-spacing: -0.025em;
+      }
+      [data-testid="stMetric"] {
+        background: #111a26;
+        border: 1px solid #263345;
+        padding: 16px;
+        border-radius: 10px;
+      }
+      [data-testid="stMetricValue"] {
+        color: #f2f5f9;
+      }
+      .disclaimer {
+        color: #9aa8b8;
+        font-size: 0.84rem;
+      }
+      div.stButton > button {
+        border-radius: 7px;
+        border: 1px solid #344256;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.markdown(
+        "# ◈ Stock<span style='color:#ff9b54'>Mind</span>",
+        unsafe_allow_html=True,
+    )
+    language = st.selectbox("Language / Sprache", list(TEXT))
+    text = TEXT[language]
+
+    page = st.radio(
+        "",
+        [
+            text["dashboard"],
+            text["analysis"],
+            text["analyst"],
+            text["education"],
+        ],
+        label_visibility="collapsed",
+    )
+
+    st.divider()
+    st.caption("Research and education · No trading")
+
+st.title("StockMind")
+st.caption("Understand the business behind the ticker.")
+
+if page == text["dashboard"]:
+    st.subheader(text["overview"])
+
+    overview = get_market_overview()
+    columns = st.columns(len(overview))
+
+    for column, item in zip(columns, overview):
+        column.metric(item["name"], item["price"], item["change"])
+
+    st.caption(
+        f"{text['source']} "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+    query = st.text_input(
+        text["search"],
+        placeholder="e.g. Apple, Microsoft, SAP",
+    )
+
+    if query:
+        results = search_companies(query)
+
+        if results:
+            chosen = st.selectbox(
+                "Results",
+                results,
+                format_func=lambda item: (
+                    f"{item['symbol']} — {item['name']} ({item['exchange']})"
+                ),
+            )
+
+            if st.button(text["refresh"]):
+                st.session_state["ticker"] = chosen["symbol"]
+                st.rerun()
+        else:
+            st.info("No matching listings found.")
+
+    st.subheader(text["watchlist"])
+
+    existing = get_watchlist()
+    add_column, remove_column = st.columns([2, 2])
+
+    with add_column:
+        new_symbol = st.text_input(
+            "Add ticker",
+            placeholder="MSFT",
+        ).upper().strip()
+
+        if st.button("＋ Add to watchlist") and new_symbol:
+            add_ticker(new_symbol)
+            st.rerun()
+
+    if existing:
+        rows = []
+
+        for symbol in existing:
+            info = get_company(symbol)
+            rows.append({
+                "Ticker": symbol,
+                "Company": info.get("name") or "—",
+                "Price": info.get("price"),
+                "Change": info.get("change"),
+            })
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with remove_column:
+            selected_remove = st.selectbox("Remove ticker", existing)
+            if st.button("Remove"):
+                remove_ticker(selected_remove)
+                st.rerun()
+    else:
+        st.caption("Your watchlist is stored locally on this device.")
+
+    st.subheader("Market news")
+    st.info(
+        "A reliable news feed is not configured in this first version. "
+        "No headlines are fabricated."
+    )
+
+    st.markdown(
+        '<p class="disclaimer">For research and education only. '
+        "Not investment advice. StockMind does not execute trades or provide "
+        "guaranteed price predictions.</p>",
+        unsafe_allow_html=True,
+    )
+
+elif page == text["education"]:
+    st.subheader("Financial metrics, clearly explained")
+
+    for name in ["Revenue", "Net income", "Profit margin", "Debt", "P/E ratio"]:
+        with st.expander(name, expanded=name == "Revenue"):
+            professional, beginner = metric_explanation(name, language)
+            st.markdown("**Professional**")
+            st.write(professional)
+            st.markdown("**Beginner friendly**")
+            st.write(beginner)
+
+else:
+    ticker = st.text_input(
+        text["ticker"],
+        value=st.session_state.get("ticker", "AAPL"),
+    ).upper().strip()
+
+    if ticker:
+        info = get_company(ticker)
+
+        if info.get("error"):
+            st.warning(f"{text['no_data']} {info['error']}")
+        else:
+            st.subheader(f"{info.get('name') or ticker} · {ticker}")
+
+            if info.get("summary"):
+                st.write(info["summary"])
+
+            st.caption(f"{text['source']} {info.get('retrieved_at')}")
+
+            metrics = [
+                ("Price", info.get("price"), info.get("change")),
+                ("Revenue (FY)", info.get("revenue"), None),
+                ("Net income (FY)", info.get("net_income"), None),
+                ("Profit margin", info.get("margin"), None),
+                ("Total debt", info.get("debt"), None),
+                ("P/E ratio", info.get("pe"), None),
+            ]
+
+            columns = st.columns(3)
+            for column, (label, value, delta) in zip(columns * 2, metrics):
+                column.metric(
+                    label,
+                    value if value is not None else text["missing"],
+                    delta,
+                )
+
+            st.caption(
+                "Fiscal-year financials are reported values when supplied by "
+                "the source; estimates are not shown in this view."
+            )
+
+            history = get_history(ticker)
+            if not history.empty:
+                figure = go.Figure(
+                    go.Scatter(
+                        x=history.index,
+                        y=history["Close"],
+                        mode="lines",
+                        line={"color": "#ff9b54", "width": 2},
+                        name="Close",
+                    )
+                )
+                figure.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="#0b1018",
+                    plot_bgcolor="#0b1018",
+                    height=350,
+                    margin={"l": 8, "r": 8, "t": 20, "b": 8},
+                    xaxis_title=None,
+                    yaxis_title="Price",
+                )
+                st.plotly_chart(figure, use_container_width=True)
+            else:
+                st.info("Historical prices are unavailable.")
+
+            left, right = st.columns(2)
+
+            with left:
+                st.markdown("#### Financial strengths")
+                if info.get("strengths"):
+                    for item in info["strengths"]:
+                        st.write("• " + item)
+                else:
+                    st.write("Insufficient reported data for an assessment.")
+
+            with right:
+                st.markdown("#### Risks and limitations")
+                if info.get("risks"):
+                    for item in info["risks"]:
+                        st.write("• " + item)
+                else:
+                    st.write(
+                        "Review the latest filings; available data may be incomplete."
+                    )
+
+            if page == text["analyst"]:
+                st.subheader("AI Analyst")
+                level = st.radio(
+                    "Explanation level",
+                    ["Beginner", "Advanced"],
+                    horizontal=True,
+                )
+                question = st.text_area(
+                    "Ask about this company or its financial metrics"
+                )
+
+                if st.button("Ask analyst", disabled=not question):
+                    with st.spinner("Preparing explanation…"):
+                        answer = ask_analyst(
+                            question,
+                            ticker,
+                            info,
+                            level,
+                            language,
+                        )
+                    st.markdown(answer)
+                    st.caption(
+                        "AI output may be incomplete or incorrect. "
+                        "Verify material facts with company filings."
+                    )
+
+st.markdown("---")
+st.caption(
+    "StockMind is an educational research tool, not investment advice. "
+    "Data can be delayed, incomplete, or incorrect. Verify with official filings. "
+    "No brokerage connections or trade execution."
+)
